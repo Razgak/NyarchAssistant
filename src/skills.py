@@ -2,6 +2,8 @@ import os
 import re
 import json
 
+from .modes import ENABLE, REMOVE
+
 
 class Skill:
     """Represents a single Agent Skill discovered from a SKILL.md file."""
@@ -42,7 +44,11 @@ def parse_frontmatter(text):
         key = line[:colon_idx].strip()
         value = line[colon_idx + 1:].strip()
         if value.startswith('"') and value.endswith('"'):
-            value = value[1:-1]
+            try:
+                decoded = json.loads(value)
+                value = decoded if isinstance(decoded, str) else value[1:-1]
+            except json.JSONDecodeError:
+                value = value[1:-1]
         elif value.startswith("'") and value.endswith("'"):
             value = value[1:-1]
         if key:
@@ -77,6 +83,18 @@ class SkillManager:
         self.settings = settings
         self.skills = {}
         self.activated_skills = set()
+        # Per-skill overrides coming from the active Mode ({name: state}).
+        # state is one of "enable" | "remove" | "no_change" (see src/modes.py).
+        self.mode_skill_overrides = {}
+
+    def set_mode_overrides(self, overrides):
+        """Set the skill overrides defined by the active Mode.
+
+        Args:
+            overrides: dict mapping skill name to a mode state
+                       ("enable"/"remove"/"no_change"). ``None`` resets them.
+        """
+        self.mode_skill_overrides = overrides or {}
 
     def _load_settings(self):
         raw = self.settings.get_string("skills-settings")
@@ -159,7 +177,14 @@ class SkillManager:
             source_dir=source_dir,
         )
 
-    def is_skill_enabled(self, skill_name):
+    def is_skill_enabled(self, skill_name, apply_overrides=True):
+        # Active Mode overrides take precedence over profile settings.
+        if apply_overrides:
+            override = self.mode_skill_overrides.get(skill_name)
+            if override == ENABLE:
+                return True
+            if override == REMOVE:
+                return False
         skills_settings = self._load_settings()
         if skill_name in skills_settings:
             return skills_settings[skill_name].get("enabled", True)

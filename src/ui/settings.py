@@ -5,6 +5,8 @@ import shutil
 import json
 import time
 import traceback
+import weakref
+import re
 from subprocess import Popen 
 
 from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gdk, GtkSource
@@ -17,6 +19,8 @@ from ..constants import AVAILABLE_EMBEDDINGS, AVAILABLE_LLMS, AVAILABLE_MEMORIES
 from ..constants import AVAILABLE_TRANSLATORS, AVAILABLE_AVATARS
 
 from ..utility.pip import install_module
+from .extension import ExtensionPage
+from .interfaces import InterfacesPage
 from .extra_settings import ExtraSettingsBuilder
 
 from .widgets import ComboRowHelper, CopyBox 
@@ -24,8 +28,9 @@ from .widgets import MultilineEntry
 from ..utility.system import can_escape_sandbox, get_spawn_command, open_website, open_folder, is_flatpak 
 
 from ..controller import NewelleController
+from ..modes import DEFAULT_MODE_NAME
 
-class Settings(Adw.PreferencesWindow):
+class Settings(Adw.Window):
     def __init__(self,app, controller: NewelleController,headless=False, startup_page=None, popup=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.app = app
@@ -35,7 +40,10 @@ class Settings(Adw.PreferencesWindow):
         self.popup = popup
         if not headless:
             self.set_transient_for(app.win)
+        self.set_title(_("Settings"))
+        self.set_default_size(950, 720)
         self.set_modal(True)
+        self.set_resizable(False)
         self.downloading = {}
         self.model_threads = {}
         self.slider_labels = {}
@@ -56,7 +64,13 @@ class Settings(Adw.PreferencesWindow):
         self.LLMPage = Adw.PreferencesPage(icon_name="brain-augemnted-symbolic", title=_("LLM")) 
         self.PromptsPage = Adw.PreferencesPage(icon_name="question-round-outline-symbolic", title=_("Prompts"))
         self.ToolsPage = Adw.PreferencesPage(icon_name="tools-symbolic", title=_("Tools"))
+        self.PermissionsPage = Adw.PreferencesPage(
+            icon_name="key-symbolic",
+            title=_("Permissions"),
+        )
         self.MemoryPage = Adw.PreferencesPage(icon_name="vcard-symbolic", title=_("Knowledge"))
+        self.SkillsPage = Adw.PreferencesPage(icon_name="skills-symbolic", title=_("Skills"))
+        self.MCPPage = Adw.PreferencesPage(icon_name="internet-symbolic", title=_("MCP Servers"))
         self.AvatarPage = Adw.PreferencesPage(icon_name="avatar-symbolic", title=_("Avatar"))
         # Dictionary containing all the rows for settings update
         self.settingsrows = {}
@@ -65,50 +79,82 @@ class Settings(Adw.PreferencesWindow):
             convert_constants=self.convert_constants,
             on_before_rebuild=self._on_extra_settings_rebuild,
         )
+        self._llm_primary_rows = []
+        self._llm_primary_other_rows = []
+        self._llm_secondary_rows = []
+        self._llm_secondary_other_rows = []
         # Build the LLMs settings
         self.LLM = Adw.PreferencesGroup(title=_('Language Model'))
-        # Add Help Button 
+        # Add duplication and help buttons.
+        llm_header_actions = Gtk.Box(spacing=3)
+        duplicate_llm = Gtk.Button(
+            css_classes=["flat"],
+            icon_name="list-add-symbolic",
+            tooltip_text=_("Add a custom LLM provider"),
+        )
+        duplicate_llm.connect("clicked", self.on_duplicate_llm)
+        llm_header_actions.append(duplicate_llm)
         help = Gtk.Button(css_classes=["flat"], icon_name="info-outline-symbolic")
         help.connect("clicked", lambda button : Popen(get_spawn_command() + ["xdg-open", "https://github.com/qwersyk/Newelle/wiki/User-guide-to-the-available-LLMs"]))
-        self.LLM.set_header_suffix(help)
-        
+        llm_header_actions.append(help)
+        self.LLM.set_header_suffix(llm_header_actions)
         # Add LLMs
         self.LLMPage.add(self.LLM)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("language-model")
         others_row = Adw.ExpanderRow(title=_('Other LLMs'), subtitle=_("Other available LLM providers"))
-        for model_key in AVAILABLE_LLMS: 
-           # Time enlapse calculation
+        self._llm_primary_other_group = others_row
+        for model_key in AVAILABLE_LLMS:
            row = self.build_row(AVAILABLE_LLMS, model_key, selected, group)
            if "secondary" in AVAILABLE_LLMS[model_key] and AVAILABLE_LLMS[model_key]["secondary"]:
                others_row.add_row(row)
+               self._llm_primary_other_rows.append(row)
            else:
                 self.LLM.add(row)
+                self._llm_primary_rows.append(row)
         self.LLM.add(others_row)
-        # Secondary LLM
-        self.SECONDARY_LLM = Adw.PreferencesGroup(title=_('Advanced LLM Settings'))
-        # Create row
+        # Secondary LLM settings
+        self.SECONDARY_LLM = Adw.PreferencesGroup(title=_('Secondary LLM'))
+        self.LLMPage.add(self.SECONDARY_LLM)
+
         secondary_LLM_enabled = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.settings.bind("secondary-llm-on", secondary_LLM_enabled, 'active', Gio.SettingsBindFlags.DEFAULT)
         secondary_LLM = Adw.ExpanderRow(title=_('Secondary Language Model'), subtitle=_("Model used for secondary tasks, like offers, chat name and memory generation"))
         secondary_LLM.add_action(secondary_LLM_enabled)
+        # Add the secondary model selector as its own expander.
         # Add LLMs
-        self.MemoryPage.add(self.SECONDARY_LLM)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("secondary-language-model")
         others_row = Adw.ExpanderRow(title=_('Other LLMs'), subtitle=_("Other available LLM providers"))
+        self._llm_secondary_model_group = secondary_LLM
+        self._llm_secondary_other_group = others_row
         for model_key in AVAILABLE_LLMS:
            row = self.build_row(AVAILABLE_LLMS, model_key, selected, group, True)
            if "secondary" in AVAILABLE_LLMS[model_key] and AVAILABLE_LLMS[model_key]["secondary"]:
                others_row.add_row(row)
+               self._llm_secondary_other_rows.append(row)
            else:
                secondary_LLM.add_row(row)
+               self._llm_secondary_rows.append(row)
         secondary_LLM.add_row(others_row)
         self.SECONDARY_LLM.add(secondary_LLM)
+
+        # Vision routing is a separate action row in the same group.
+        vision_row = Adw.ActionRow(
+            title=_("Use secondary LLM for vision"),
+            subtitle=_("Use the secondary model for chats containing images or videos"),
+        )
+        vision_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        vision_row.add_suffix(vision_switch)
+        self.settings.bind("secondary-llm-vision", vision_switch, 'active', Gio.SettingsBindFlags.DEFAULT)
+        self.SECONDARY_LLM.add(vision_row)
+
+        self.KNOWLEDGE = Adw.PreferencesGroup(title=_('Advanced LLM Settings'))
+        self.MemoryPage.add(self.KNOWLEDGE)
         
         # Build the Embedding settings
         embedding_row = Adw.ExpanderRow(title=_('Embedding Model'), subtitle=_("Embedding is used to trasform text into vectors. Used by Long Term Memory and RAG. Changing it might require you to re-index documents or reset memory."))
-        self.SECONDARY_LLM.add(embedding_row)
+        self.KNOWLEDGE.add(embedding_row)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("embedding-model")
         for key in AVAILABLE_EMBEDDINGS:
@@ -120,7 +166,7 @@ class Settings(Adw.PreferencesWindow):
         self.settings.bind("memory-on", memory_enabled, 'active', Gio.SettingsBindFlags.DEFAULT)
         tts_program = Adw.ExpanderRow(title=_('Long Term Memory'), subtitle=_("Keep memory of old conversations"))
         tts_program.add_action(memory_enabled)
-        self.SECONDARY_LLM.add(tts_program)
+        self.KNOWLEDGE.add(tts_program)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("memory-model")
         for key in AVAILABLE_MEMORIES:
@@ -132,7 +178,7 @@ class Settings(Adw.PreferencesWindow):
         self.settings.bind("websearch-on", web_enabled, 'active', Gio.SettingsBindFlags.DEFAULT)
         tts_program = Adw.ExpanderRow(title=_('Web Search'), subtitle=_("Search information on the Web"))
         tts_program.add_action(web_enabled)
-        self.SECONDARY_LLM.add(tts_program)
+        self.KNOWLEDGE.add(tts_program)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("websearch-model")
         for key in AVAILABLE_WEBSEARCH:
@@ -140,7 +186,7 @@ class Settings(Adw.PreferencesWindow):
            tts_program.add_row(row)
         # Build the Image Generator settings
         image_generator_row = Adw.ExpanderRow(title=_('Image Generator'), subtitle=_("Choose which image generation engine to use"))
-        self.SECONDARY_LLM.add(image_generator_row)
+        self.KNOWLEDGE.add(image_generator_row)
         group = Gtk.CheckButton()
         selected = self.settings.get_string("image-generator")
         for key in AVAILABLE_IMAGE_GENERATORS:
@@ -369,6 +415,10 @@ class Settings(Adw.PreferencesWindow):
         # Build tools settings lazily (first time Tools page is opened)
         self.tools_page_initialized = False
         self._building_tools_page = False
+        self.permissions_page_initialized = False
+        self._building_permissions_page = False
+        self.skills_page_initialized = False
+        self.mcp_page_initialized = False
         self.tool_rows = []
         # Interface settings
         self.interface = Adw.PreferencesGroup(title=_('Interface'))
@@ -469,17 +519,26 @@ class Settings(Adw.PreferencesWindow):
         row.add_suffix(switch)
         self.settings.bind("send-on-enter", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
         self.interface.add(row)
-
-        row = Adw.ActionRow(title=_("Remove thinking from history"), subtitle=_("Do not send old thinking blocks for reasoning models in order to reduce token usage"))
-        switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        row.add_suffix(switch)
-        self.settings.bind("remove-thinking", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
-        self.interface.add(row)
-        
+ 
         row = Adw.ActionRow(title=_("Display LaTeX"), subtitle=_("Display LaTeX formulas in chat"))
         switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         row.add_suffix(switch)
         self.settings.bind("display-latex", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
+        self.interface.add(row)
+
+        row = Adw.ActionRow(title=_("Expand reasoning by default"), subtitle=_("Expand the reasoning widget by default and keep it expanded when finished"))
+        switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        row.add_suffix(switch)
+        self.settings.bind("expand-reasoning", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
+        self.interface.add(row)
+
+        row = Adw.ActionRow(
+            title=_("Compact mode"),
+            subtitle=_("Group tool calls from each agent iteration into one expandable box"),
+        )
+        switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        row.add_suffix(switch)
+        self.settings.bind("compact-mode", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
         self.interface.add(row)
 
         row = Adw.ActionRow(title=_("Reverse Chat Order"), subtitle=_("Show most recent chats on top in chat list (change chat to apply)"))
@@ -542,6 +601,23 @@ class Settings(Adw.PreferencesWindow):
         row.add_suffix(switch)
         self.settings.bind("parallel-tool-execution", switch, 'active', Gio.SettingsBindFlags.DEFAULT)
         self.neural_network.add(row)
+
+        max_tool_calls_row = Adw.SpinRow(
+            title=_("Maximum Tool Calls"),
+            subtitle=_("Maximum number of tools the model can run for one request, including scheduled tasks"),
+            adjustment=Gtk.Adjustment(
+                lower=1,
+                upper=300,
+                step_increment=1,
+                page_increment=10,
+                value=self.settings.get_int("max-tool-calls"),
+            ),
+            digits=0,
+        )
+        def update_max_tool_calls(spin, _value):
+            self.settings.set_int("max-tool-calls", int(spin.get_value()))
+        max_tool_calls_row.connect("notify::value", update_max_tool_calls)
+        self.neural_network.add(max_tool_calls_row)
         
         row = Adw.ExpanderRow(title=_("External Terminal"), subtitle=_("Choose the external terminal where to run the console commands"))
         terminal_enabled = Gtk.Switch(valign=Gtk.Align.CENTER)
@@ -663,7 +739,7 @@ class Settings(Adw.PreferencesWindow):
         for r in self.context_fixed_rows:
             r.set_visible(not is_cm)
 
-        self.SECONDARY_LLM.add(context_expander)
+        self.KNOWLEDGE.add(context_expander)
         # Developer settings
         self.developer = Adw.PreferencesGroup(title=_('Developer'))
         self.general_page.add(self.developer)
@@ -695,26 +771,149 @@ class Settings(Adw.PreferencesWindow):
         button.connect("clicked", install_custom_module)
         self.developer.add(row)
         
-        self.add(self.LLMPage)
-        self.add(self.PromptsPage)
-        self.add(self.ToolsPage)
-        self.add(self.MemoryPage)
-        self.add(self.AvatarPage)
-        self.add(self.general_page)  
-        self.connect("notify::visible-page", self.on_visible_page_changed)
+        if self.popup:
+            self.InterfacesPage = Adw.PreferencesPage(
+                icon_name="controls-big-symbolic",
+                title=_("Interfaces"),
+            )
+            self.ExtensionsPage = Adw.PreferencesPage(
+                icon_name="extension-symbolic",
+                title=_("Extensions"),
+            )
+        else:
+            self.InterfacesPage = InterfacesPage(
+                self.app,
+                self.controller,
+            )
+            self.ExtensionsPage = ExtensionPage(
+                self.app,
+                self.controller,
+                toast_callback=self.add_toast,
+            )
+
+        self._build_navigation(startup_page)
         if self.popup:
             # Popup uses tools_group immediately when building its stack.
             self.ensure_tools_page_initialized()
-        if startup_page is not None:
-            pages = {"LLM": self.LLMPage, "Prompts": self.PromptsPage, "Memory": self.MemoryPage, "General": self.general_page, "avatar": self.AvatarPage}
-            self.set_visible_page(pages[startup_page])
-    def on_visible_page_changed(self, _window, _pspec):
-        if self.get_visible_page() == self.ToolsPage:
+
+    def add_toast(self, toast):
+        self.toast_overlay.add_toast(toast)
+
+    def _build_navigation(self, startup_page):
+        self.toast_overlay = Adw.ToastOverlay()
+        self.split_view = Adw.NavigationSplitView()
+        self.content_stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            transition_duration=150,
+        )
+
+        page_definitions = [
+            ("General", _("General"), "settings-symbolic", self.general_page),
+            ("LLM", _("LLM"), "brain-augemnted-symbolic", self.LLMPage),
+            ("Memory", _("Knowledge"), "vcard-symbolic", self.MemoryPage),
+            ("avatar", _("Avatar"), "avatar-symbolic", self.AvatarPage),
+            ("Prompts", _("Prompts"), "question-round-outline-symbolic", self.PromptsPage),
+            ("Tools", _("Tools"), "tools-symbolic", self.ToolsPage),
+            ("Permissions", _("Permissions"), "key-symbolic", self.PermissionsPage),
+            ("Skills", _("Skills"), "skills-symbolic", self.SkillsPage),
+            ("MCP", _("MCP Servers"), "internet-symbolic", self.MCPPage),
+            ("Interfaces", _("Interfaces"), "controls-big-symbolic", self.InterfacesPage),
+            ("Extensions", _("Extensions"), "extension-symbolic", self.ExtensionsPage),
+        ]
+        self.navigation_pages = {
+            key: (title, page)
+            for key, title, _icon_name, page in page_definitions
+        }
+
+        self.navigation_list = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.SINGLE,
+            activate_on_single_click=True,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=6,
+            margin_end=6,
+        )
+        self.navigation_list.add_css_class("navigation-sidebar")
+        self.navigation_list.connect("row-selected", self.on_navigation_row_selected)
+        self.navigation_list.connect("row-activated", self.on_navigation_row_activated)
+
+        self.navigation_rows = {}
+        for key, title, icon_name, page in page_definitions:
+            self.content_stack.add_named(page, key)
+            row = Adw.ActionRow(title=title)
+            row.add_prefix(Gtk.Image(icon_name=icon_name))
+            row.settings_page_key = key
+            self.navigation_list.append(row)
+            self.navigation_rows[key] = row
+
+        sidebar_scroll = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+        )
+        sidebar_scroll.set_child(self.navigation_list)
+        sidebar_toolbar = Adw.ToolbarView()
+        sidebar_toolbar.add_top_bar(Adw.HeaderBar())
+        sidebar_toolbar.set_content(sidebar_scroll)
+        sidebar_page = Adw.NavigationPage.new(sidebar_toolbar, _("Settings"))
+
+        content_toolbar = Adw.ToolbarView()
+        content_toolbar.add_top_bar(Adw.HeaderBar())
+        content_toolbar.set_content(self.content_stack)
+        self.content_navigation_page = Adw.NavigationPage.new(
+            content_toolbar,
+            _("General"),
+        )
+
+        self.split_view.set_sidebar(sidebar_page)
+        self.split_view.set_content(self.content_navigation_page)
+        self.toast_overlay.set_child(self.split_view)
+        self.set_content(self.toast_overlay)
+
+        breakpoint = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("max-width: 700sp")
+        )
+        breakpoint.add_setter(self.split_view, "collapsed", True)
+        self.add_breakpoint(breakpoint)
+
+        selected_key = startup_page if startup_page in self.navigation_rows else "General"
+        self.navigation_list.select_row(self.navigation_rows[selected_key])
+        if startup_page in self.navigation_rows:
+            self.split_view.set_show_content(True)
+
+    def on_navigation_row_selected(self, _listbox, row):
+        if row is None:
+            return
+        key = row.settings_page_key
+        title, page = self.navigation_pages[key]
+        if page == self.ToolsPage:
             self.ensure_tools_page_initialized()
+        elif page == self.PermissionsPage:
+            self.ensure_permissions_page_initialized()
+        elif page == self.SkillsPage:
+            self.ensure_skills_page_initialized()
+        elif page == self.MCPPage:
+            self.ensure_mcp_page_initialized()
+        self.content_stack.set_visible_child(page)
+        self.content_navigation_page.set_title(title)
+
+    def on_navigation_row_activated(self, _listbox, _row):
+        self.split_view.set_show_content(True)
 
     def ensure_tools_page_initialized(self):
         if not self.tools_page_initialized:
             self.build_tools_page()
+
+    def ensure_permissions_page_initialized(self):
+        if not self.permissions_page_initialized:
+            self.build_permissions_page()
+
+    def ensure_skills_page_initialized(self):
+        if not self.skills_page_initialized:
+            self.build_skills_settings()
+
+    def ensure_mcp_page_initialized(self):
+        if not self.mcp_page_initialized:
+            self.build_mcp_settings()
 
     def build_tools_page(self):
         if self.tools_page_initialized or self._building_tools_page:
@@ -724,13 +923,366 @@ class Settings(Adw.PreferencesWindow):
         self.tools_group = Adw.PreferencesGroup(title=_("Tools"))
         self.ToolsPage.add(self.tools_group)
         self.refresh_tools_list()
+        self._building_tools_page = False
 
+    def refresh_extension_resources(self, refreshes):
+        """Refresh only settings sections affected by extension changes."""
+        self.extensionloader = self.controller.extensionloader
+        self.handlers = self.controller.handlers
+        if "llm_handlers" in refreshes:
+            self.refresh_llm_rows()
+        if "tools" in refreshes and self.tools_page_initialized:
+            self.refresh_tools_list()
+        if "prompts" in refreshes:
+            self.custom_prompts = self.controller.newelle_settings.custom_prompts
+            self.prompts_settings = self.controller.newelle_settings.prompts_settings
+            self.prompts = self.controller.newelle_settings.prompts
+            self.build_prompts_settings()
+        if "interfaces" in refreshes and hasattr(self.InterfacesPage, "refresh"):
+            self.InterfacesPage.refresh()
+
+    def refresh_llm_rows(self):
+        """Refresh primary and secondary LLM choices in this live window."""
+        for row in self._llm_primary_rows:
+            self.LLM.remove(row)
+        for row in self._llm_primary_other_rows:
+            self._llm_primary_other_group.remove(row)
+        for row in self._llm_secondary_rows:
+            self._llm_secondary_model_group.remove(row)
+        for row in self._llm_secondary_other_rows:
+            self._llm_secondary_other_group.remove(row)
+        # Keep the catch-all expander after all regular providers.  If it stays
+        # attached while rows are rebuilt, newly added providers are appended
+        # after it and make “Other LLMs” jump up the list.
+        self.LLM.remove(self._llm_primary_other_group)
+        self._llm_secondary_model_group.remove(self._llm_secondary_other_group)
+
+        llm_constant = self.convert_constants(AVAILABLE_LLMS)
+        for settings_key in list(self.settingsrows):
+            if (
+                len(settings_key) == 3
+                and settings_key[1] == llm_constant
+                and settings_key[2] in (False, True)
+            ):
+                del self.settingsrows[settings_key]
+
+        self._llm_primary_rows = []
+        self._llm_primary_other_rows = []
+        self._llm_secondary_rows = []
+        self._llm_secondary_other_rows = []
+
+        primary_group = Gtk.CheckButton()
+        selected = self.settings.get_string("language-model")
+        for model_key in AVAILABLE_LLMS:
+            row = self.build_row(AVAILABLE_LLMS, model_key, selected, primary_group)
+            if AVAILABLE_LLMS[model_key].get("secondary", False):
+                self._llm_primary_other_group.add_row(row)
+                self._llm_primary_other_rows.append(row)
+            else:
+                self.LLM.add(row)
+                self._llm_primary_rows.append(row)
+        self.LLM.add(self._llm_primary_other_group)
+
+        secondary_group = Gtk.CheckButton()
+        selected = self.settings.get_string("secondary-language-model")
+        for model_key in AVAILABLE_LLMS:
+            row = self.build_row(
+                AVAILABLE_LLMS,
+                model_key,
+                selected,
+                secondary_group,
+                True,
+            )
+            if AVAILABLE_LLMS[model_key].get("secondary", False):
+                self._llm_secondary_other_group.add_row(row)
+                self._llm_secondary_other_rows.append(row)
+            else:
+                self._llm_secondary_model_group.add_row(row)
+                self._llm_secondary_rows.append(row)
+        self._llm_secondary_model_group.add_row(self._llm_secondary_other_group)
+
+    @staticmethod
+    def _suggest_duplicated_llm_key(source_key: str) -> str:
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_", source_key).strip("._-")
+        base = (base or "llm") + "_copy"
+        candidate = base
+        suffix = 2
+        while candidate in AVAILABLE_LLMS:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def on_duplicate_llm(self, _button):
+        """Open the dialog used to create a custom copy of an LLM handler."""
+        duplicable = self.handlers.get_duplicable_llms()
+        if not duplicable:
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                modal=True,
+                heading=_("No handlers can be duplicated"),
+                body=_("No LLM handler exposes duplication settings."),
+            )
+            dialog.add_response("close", _("Close"))
+            dialog.set_close_response("close")
+            dialog.connect("response", lambda current, _response: current.destroy())
+            dialog.present()
+            return
+
+        dialog = Gtk.Window(
+            title=_("Add LLM Provider"),
+            transient_for=self,
+            modal=True,
+            destroy_with_parent=True,
+        )
+        dialog.set_default_size(600, 560)
+        header = Adw.HeaderBar(css_classes=["flat"])
+        dialog.set_titlebar(header)
+        cancel_button = Gtk.Button(label=_("Cancel"), css_classes=["flat"])
+        cancel_button.connect("clicked", lambda _clicked: dialog.close())
+        add_button = Gtk.Button(
+            label=_("Add"), css_classes=["suggested-action"]
+        )
+        header.pack_start(cancel_button)
+        header.pack_end(add_button)
+
+        page = Adw.PreferencesPage()
+        details_group = Adw.PreferencesGroup(
+            title=_("Provider"),
+            description=_("Choose a handler implementation and identify the new provider."),
+        )
+        page.add(details_group)
+
+        source_row = Adw.ComboRow(
+            title=_("Copy LLM Handler"),
+            subtitle=_("The implementation used by this provider"),
+        )
+        source_options = tuple(
+            (descriptor["title"], source_key)
+            for source_key, descriptor, _settings in duplicable
+        )
+        default_source = (
+            "openai"
+            if any(source_key == "openai" for _title, source_key in source_options)
+            else source_options[0][1]
+        )
+        source_helper = ComboRowHelper(source_row, source_options, default_source)
+        details_group.add(source_row)
+
+        name_row = Adw.EntryRow(title=_("Handler Name"))
+        key_row = Adw.EntryRow(title=_("Handler Key"))
+        description_row = Adw.EntryRow(title=_("Description"))
+        details_group.add(name_row)
+        details_group.add(key_row)
+        details_group.add(description_row)
+
+        validation_row = Adw.ActionRow()
+        validation_row.add_css_class("error")
+        validation_row.set_visible(False)
+        details_group.add(validation_row)
+
+        duplication_group = Adw.PreferencesGroup(
+            title=_("Connection"),
+            description=_("Settings needed to create this provider."),
+        )
+        page.add(duplication_group)
+        scrolled = Gtk.ScrolledWindow(vexpand=True, hexpand=True)
+        scrolled.set_child(page)
+        dialog.set_child(scrolled)
+
+        duplication_by_source = {
+            source_key: (descriptor, settings)
+            for source_key, descriptor, settings in duplicable
+        }
+        duplication_rows = []
+        duplication_values = {}
+        setting_helpers = []
+        selected_source = default_source
+
+        def set_validation_error(message: str):
+            validation_row.set_title(message)
+            validation_row.set_visible(bool(message))
+
+        def validate(*_args):
+            name = name_row.get_text().strip()
+            key = key_row.get_text().strip()
+            message = ""
+            if not name:
+                message = _("Enter a handler name.")
+            elif not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", key):
+                message = _("Use only letters, numbers, '.', '_' and '-' in the key.")
+            elif key in AVAILABLE_LLMS:
+                message = _("This handler key is already in use.")
+            set_validation_error(message)
+            add_button.set_sensitive(not message)
+
+        def add_duplication_setting(setting: dict):
+            if setting.get("type") == "nested":
+                for nested in setting.get("extra_settings", []):
+                    add_duplication_setting(nested)
+                return
+            setting_key = setting.get("key")
+            if not setting_key:
+                return
+            value = setting.get("default")
+            duplication_values[setting_key] = value
+
+            if setting.get("type") in ("entry", "multilineentry"):
+                setting_row = Adw.EntryRow(
+                    title=setting.get("title", setting_key),
+                    text="" if value is None else str(value),
+                )
+                setting_row.connect(
+                    "changed",
+                    lambda current, current_key=setting_key: duplication_values.__setitem__(
+                        current_key, current.get_text()
+                    ),
+                )
+            elif setting.get("type") == "toggle":
+                setting_row = Adw.ActionRow(
+                    title=setting.get("title", setting_key),
+                    subtitle=setting.get("description", ""),
+                )
+                toggle = Gtk.Switch(valign=Gtk.Align.CENTER, active=bool(value))
+                toggle.connect(
+                    "notify::active",
+                    lambda current, _pspec, current_key=setting_key: duplication_values.__setitem__(
+                        current_key, current.get_active()
+                    ),
+                )
+                setting_row.add_suffix(toggle)
+            elif setting.get("type") == "combo":
+                setting_row = Adw.ComboRow(
+                    title=setting.get("title", setting_key),
+                    subtitle=setting.get("description", ""),
+                )
+                helper = ComboRowHelper(
+                    setting_row, setting.get("values", ()), value
+                )
+                helper.connect(
+                    "changed",
+                    lambda _helper, current_value, current_key=setting_key: duplication_values.__setitem__(
+                        current_key, current_value
+                    ),
+                )
+                setting_helpers.append(helper)
+            elif setting.get("type") in ("range", "spin"):
+                digits = setting.get("round-digits", 0)
+                adjustment = Gtk.Adjustment(
+                    value=value,
+                    lower=setting.get("min", 0),
+                    upper=setting.get("max", 100),
+                    step_increment=setting.get("step", 1),
+                    page_increment=setting.get("page", 10),
+                )
+                setting_row = Adw.SpinRow(
+                    title=setting.get("title", setting_key),
+                    subtitle=setting.get("description", ""),
+                    adjustment=adjustment,
+                    digits=digits,
+                )
+
+                def on_value_changed(current, _pspec, current_key=setting_key):
+                    current_value = current.get_value()
+                    if current.get_digits() == 0:
+                        current_value = int(current_value)
+                    duplication_values[current_key] = current_value
+
+                setting_row.connect("notify::value", on_value_changed)
+            else:
+                return
+
+            if setting.get("type") == "entry":
+                setting_row.set_show_apply_button(False)
+            duplication_group.add(setting_row)
+            duplication_rows.append(setting_row)
+
+        def select_source(source_key: str):
+            nonlocal selected_source
+            selected_source = source_key
+            for old_row in duplication_rows:
+                duplication_group.remove(old_row)
+            duplication_rows.clear()
+            duplication_values.clear()
+            setting_helpers.clear()
+
+            descriptor, settings = duplication_by_source[source_key]
+            name_row.set_text(_("{0} Copy").format(descriptor["title"]))
+            key_row.set_text(self._suggest_duplicated_llm_key(source_key))
+            description_row.set_text(
+                _("Custom provider based on {0}").format(descriptor["title"])
+            )
+            for setting in settings:
+                add_duplication_setting(setting)
+            duplication_group.set_visible(bool(duplication_rows))
+            validate()
+
+        source_helper.connect(
+            "changed", lambda _helper, source_key: select_source(source_key)
+        )
+        name_row.connect("changed", validate)
+        key_row.connect("changed", validate)
+        select_source(selected_source)
+
+        def create_duplicate(_clicked):
+            try:
+                self.handlers.duplicate_llm(
+                    source=selected_source,
+                    key=key_row.get_text(),
+                    title=name_row.get_text(),
+                    description=description_row.get_text(),
+                    duplication_values=duplication_values,
+                )
+            except ValueError as error:
+                set_validation_error(str(error))
+                add_button.set_sensitive(False)
+                return
+            self.refresh_llm_rows()
+            dialog.close()
+
+        add_button.connect("clicked", create_duplicate)
+        # Keep helpers alive for as long as their GTK signal handlers are used.
+        dialog._llm_duplication_helpers = [source_helper, setting_helpers]
+        dialog.present()
+
+    def on_delete_duplicated_llm(self, _button, key: str):
+        descriptor = AVAILABLE_LLMS.get(key)
+        if descriptor is None or not descriptor.get("duplicated", False):
+            return
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            modal=True,
+            heading=_("Delete LLM Provider?"),
+            body=_("Delete {0} and all of its saved settings?").format(
+                descriptor["title"]
+            ),
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("delete", _("Delete"))
+        dialog.set_close_response("cancel")
+        dialog.set_default_response("cancel")
+        dialog.set_response_appearance(
+            "delete", Adw.ResponseAppearance.DESTRUCTIVE
+        )
+
+        def on_response(current, response):
+            if response == "delete" and self.handlers.delete_duplicated_llm(key):
+                self.refresh_llm_rows()
+                if self.popup:
+                    self.app.win.update_available_models()
+            current.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.present()
+
+    def build_permissions_page(self):
+        if self.permissions_page_initialized or self._building_permissions_page:
+            return
+        self._building_permissions_page = True
+        self.permissions_page_initialized = True
         self.build_file_permissions_settings()
         self.build_command_permissions_settings()
         self.build_path_security_settings()
-        self.build_skills_settings()
-        self.build_mcp_settings()
-        self._building_tools_page = False
+        self._building_permissions_page = False
 
     def _perf_add(self, name: str):
         if self.p is not None:
@@ -827,7 +1379,12 @@ class Settings(Adw.PreferencesWindow):
         icon_name = tool.icon_name if tool.icon_name else "tools-symbolic"
         tool_icon = Gtk.Image(icon_name=icon_name, css_classes=["dim-label"])
         row.add_prefix(tool_icon)
-        
+
+        # Small warning when the active mode overrides this tool's enablement
+        mode_warning = self._get_tool_mode_warning(tool.name, is_enabled)
+        if mode_warning is not None:
+            self._add_mode_warning_suffix(row, mode_warning)
+
         # Toggle
         toggle = Gtk.Switch(valign=Gtk.Align.CENTER)
         toggle.set_active(is_enabled)
@@ -928,7 +1485,7 @@ class Settings(Adw.PreferencesWindow):
             title=_("File Permissions"),
             description=_("Control which directories the agent can read from or write to")
         )
-        self.ToolsPage.add(self.file_permissions_group)
+        self.PermissionsPage.add(self.file_permissions_group)
 
         add_button = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"])
         add_button.set_tooltip_text(_("Add custom directory rule"))
@@ -1071,7 +1628,7 @@ class Settings(Adw.PreferencesWindow):
             title=_("Command Execution Permissions"),
             description=_("Control which commands can run automatically via pattern rules")
         )
-        self.ToolsPage.add(self.cmd_perms_group)
+        self.PermissionsPage.add(self.cmd_perms_group)
 
         autorun_row = Adw.ExpanderRow(title=_("Auto-run commands"), subtitle=_("Automatically execute commands (subject to permission rules below)"))
         autorun_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
@@ -1213,7 +1770,7 @@ class Settings(Adw.PreferencesWindow):
             title=_("Path Security Levels"),
             description=_("Set trust levels for directories — affects auto-run behavior")
         )
-        self.ToolsPage.add(self.path_security_group)
+        self.PermissionsPage.add(self.path_security_group)
 
         add_button = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"])
         add_button.set_tooltip_text(_("Add path security rule"))
@@ -1358,11 +1915,60 @@ class Settings(Adw.PreferencesWindow):
     # --- Skills settings ---
 
     def build_skills_settings(self):
+        if self.skills_page_initialized:
+            return
+        self.skills_page_initialized = True
+
+        self.skills_marketplace_initialized = False
+        self.skills_creator_initialized = False
+        self.skills_tabs_group = Adw.PreferencesGroup()
+        self.skills_tabs_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=18,
+        )
+        self.skills_view_stack = Adw.ViewStack(vhomogeneous=False)
+        self.skills_view_stack.connect(
+            "notify::visible-child-name",
+            self._on_skills_tab_changed,
+        )
+
+        self.installed_skills_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.marketplace_skills_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.create_skills_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.skills_view_stack.add_titled_with_icon(
+            self.installed_skills_page,
+            name="installed",
+            title=_("Installed"),
+            icon_name="skills-symbolic",
+        )
+        self.skills_view_stack.add_titled_with_icon(
+            self.marketplace_skills_page,
+            name="marketplace",
+            title=_("Marketplace"),
+            icon_name="folder-download-symbolic",
+        )
+        self.skills_view_stack.add_titled_with_icon(
+            self.create_skills_page,
+            name="create",
+            title=_("Create"),
+            icon_name="document-edit-symbolic",
+        )
+
+        self.skills_view_switcher = Adw.ViewSwitcher(
+            stack=self.skills_view_stack,
+            policy=Adw.ViewSwitcherPolicy.WIDE,
+            halign=Gtk.Align.CENTER,
+        )
+        self.skills_tabs_box.append(self.skills_view_switcher)
+        self.skills_tabs_box.append(self.skills_view_stack)
+        self.skills_tabs_group.add(self.skills_tabs_box)
+        self.SkillsPage.add(self.skills_tabs_group)
+
         self.skills_group = Adw.PreferencesGroup(
-            title=_("Skills"),
+            title=_("Installed Skills"),
             description=_("Manage Agent Skills (SKILL.md files)")
         )
-        self.ToolsPage.add(self.skills_group)
+        self.installed_skills_page.append(self.skills_group)
 
         actions_row = Adw.ActionRow(title=_("Skills folder"), subtitle=self.controller.skills_path)
         open_button = Gtk.Button(icon_name="folder-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"])
@@ -1384,6 +1990,148 @@ class Settings(Adw.PreferencesWindow):
 
         self.skills_rows = []
         self.refresh_skills_list()
+        self.skills_view_stack.set_visible_child_name("installed")
+
+    def _on_skills_tab_changed(self, stack, _pspec):
+        visible_page = stack.get_visible_child_name()
+        if visible_page == "marketplace" and not self.skills_marketplace_initialized:
+            self.skills_marketplace_initialized = True
+            from .skills_catalog import SkillsCatalogView
+
+            self.skills_catalog_group = Adw.PreferencesGroup(
+                title=_("Skills Marketplace"),
+                description=_("Search and install community skills from SkillsMP"),
+            )
+            self.skills_catalog = SkillsCatalogView(
+                parent=self,
+                controller=self.controller,
+                on_installed=self._on_catalog_skill_installed,
+            )
+            self.skills_catalog_group.add(self.skills_catalog)
+            self.marketplace_skills_page.append(self.skills_catalog_group)
+        elif visible_page == "create" and not self.skills_creator_initialized:
+            self._ensure_skill_creator()
+
+    def _make_weak_skills_refresh_callback(self):
+        settings_ref = weakref.ref(self)
+
+        def refresh_if_open():
+            settings = settings_ref()
+            if settings is not None and settings.get_visible():
+                settings.refresh_skills_list()
+
+        return refresh_if_open
+
+    def _ensure_skill_creator(self):
+        if self.skills_creator_initialized:
+            return self.skills_creator
+        self.skills_creator_initialized = True
+        from .skill_creator import SkillCreatorView
+
+        self.skills_creator = SkillCreatorView(
+            host=self,
+            controller=self.controller,
+            on_saved=self._make_weak_skills_refresh_callback(),
+            on_open_window=self._on_open_skill_creator_window,
+        )
+        self.create_skills_page.append(self.skills_creator)
+        return self.skills_creator
+
+    def _register_skill_editor_window(self):
+        self._open_skill_editor_count = (
+            getattr(self, "_open_skill_editor_count", 0) + 1
+        )
+        self.set_modal(False)
+        settings_ref = weakref.ref(self)
+
+        def editor_closed():
+            settings = settings_ref()
+            if settings is None:
+                return
+            settings._open_skill_editor_count = max(
+                0,
+                getattr(settings, "_open_skill_editor_count", 1) - 1,
+            )
+            if settings._open_skill_editor_count == 0 and settings.get_visible():
+                settings.set_modal(True)
+
+        return editor_closed
+
+    def _on_open_skill_creator_window(self, editor):
+        from .skill_creator import SkillEditorWindow
+
+        self.create_skills_page.remove(editor)
+        editor.set_open_window_callback(None)
+
+        placeholder = Adw.PreferencesGroup()
+        placeholder_row = Adw.ActionRow(
+            title=_("Skill editor is open in another window"),
+            subtitle=_("The editor keeps working if you close Settings."),
+        )
+        placeholder_row.add_prefix(
+            Gtk.Image(icon_name="document-edit-symbolic")
+        )
+        present_button = Gtk.Button(
+            label=_("Show Editor"),
+            icon_name="window-new-symbolic",
+            valign=Gtk.Align.CENTER,
+            css_classes=["suggested-action"],
+        )
+        placeholder_row.add_suffix(present_button)
+        placeholder.add(placeholder_row)
+        self.skill_creator_placeholder = placeholder
+        self.create_skills_page.append(placeholder)
+
+        settings_ref = weakref.ref(self)
+
+        def return_editor(returned_editor):
+            settings = settings_ref()
+            if settings is None or not settings.get_visible():
+                return False
+            settings._reattach_skill_creator(returned_editor)
+            return True
+
+        window = SkillEditorWindow(
+            application=self.app,
+            editor=editor,
+            return_editor=return_editor,
+            on_closed=self._register_skill_editor_window(),
+        )
+        self.skill_editor_window = window
+        present_button.connect("clicked", lambda _button: window.present())
+        window.present()
+
+    def _reattach_skill_creator(self, editor):
+        placeholder = getattr(self, "skill_creator_placeholder", None)
+        if placeholder is not None and placeholder.get_parent() is not None:
+            self.create_skills_page.remove(placeholder)
+        editor.set_host(self)
+        editor.set_windowed(False)
+        editor.set_open_window_callback(self._on_open_skill_creator_window)
+        self.create_skills_page.append(editor)
+        self.skills_creator = editor
+        self.skill_editor_window = None
+        self.refresh_skills_list()
+
+    def _on_edit_skill_clicked(self, _button, skill):
+        from .skill_creator import SkillCreatorView, SkillEditorWindow
+
+        editor = SkillCreatorView(
+            host=None,
+            controller=self.controller,
+            on_saved=self._make_weak_skills_refresh_callback(),
+        )
+        window = SkillEditorWindow(
+            application=self.app,
+            editor=editor,
+            on_closed=self._register_skill_editor_window(),
+            title=_("Edit {}").format(skill.name),
+        )
+        if editor.load_skill(skill):
+            window.present()
+        else:
+            window.close()
+            self.add_toast(Adw.Toast(title=_("Could not open skill for editing")))
 
     def refresh_skills_list(self):
         for row in self.skills_rows:
@@ -1407,15 +2155,39 @@ class Settings(Adw.PreferencesWindow):
         row.add_suffix(toggle)
 
         info_row = Adw.ActionRow(title=_("Location"), subtitle=skill.location)
+        edit_button = Gtk.Button(
+            label=_("Edit"),
+            icon_name="document-edit-symbolic",
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat"],
+        )
+        edit_button.set_tooltip_text(_("Edit skill"))
+        edit_button.connect("clicked", self._on_edit_skill_clicked, skill)
+        info_row.add_suffix(edit_button)
+        open_button = Gtk.Button(
+            icon_name="folder-visiting-symbolic",
+            valign=Gtk.Align.CENTER,
+            css_classes=["flat"],
+        )
+        open_button.set_tooltip_text(_("Open skill folder"))
+        open_button.connect(
+            "clicked",
+            lambda _button, path=skill.base_dir: open_folder(path),
+        )
+        info_row.add_suffix(open_button)
         row.add_row(info_row)
 
-        resource_count = len(self.controller.skill_manager._list_resources(skill.base_dir))
-        if resource_count > 0:
-            res_row = Adw.ActionRow(
-                title=_("Bundled resources"),
-                subtitle=str(resource_count) + " " + (_("files") if resource_count != 1 else _("file"))
-            )
-            row.add_row(res_row)
+        resource_row = Adw.ActionRow(
+            title=_("Bundled resources"),
+            subtitle=_("Expand to count files"),
+        )
+        row.add_row(resource_row)
+        row.connect(
+            "notify::expanded",
+            self._on_skill_row_expanded,
+            skill,
+            resource_row,
+        )
 
         remove_row = Adw.ActionRow(title=_("Remove skill"))
         remove_button = Gtk.Button(label=_("Remove"), valign=Gtk.Align.CENTER, css_classes=["destructive-action"])
@@ -1424,6 +2196,27 @@ class Settings(Adw.PreferencesWindow):
         row.add_row(remove_row)
 
         return row
+
+    def _on_skill_row_expanded(self, row, _pspec, skill, resource_row):
+        if not row.get_expanded() or getattr(row, "_resources_loading", False):
+            return
+        row._resources_loading = True
+        resource_row.set_subtitle(_("Counting files…"))
+
+        def worker():
+            count = len(self.controller.skill_manager._list_resources(skill.base_dir))
+            GLib.idle_add(self._finish_skill_resource_count, resource_row, count)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_skill_resource_count(self, resource_row, count):
+        resource_row.set_subtitle(
+            str(count) + " " + (_("files") if count != 1 else _("file"))
+        )
+        return False
+
+    def _on_catalog_skill_installed(self):
+        self.refresh_skills_list()
 
     def _on_skill_toggled(self, switch, state, skill_name):
         self.controller.skill_manager.set_skill_enabled(skill_name, state)
@@ -1470,13 +2263,32 @@ class Settings(Adw.PreferencesWindow):
 
     # --- MCP settings ---
 
+    def _on_mcp_application_connected(self):
+        self.refresh_mcp_servers_list()
+        self.refresh_tools_list()
+
     def build_mcp_settings(self):
+        if self.mcp_page_initialized:
+            return
+        self.mcp_page_initialized = True
+        from .mcp_catalog import ConnectApplicationView
+
+        self.mcp_catalog_group = Adw.PreferencesGroup(
+            title=_("Connect Application"),
+            description=_("Choose an application from the MCP catalog"),
+        )
+        self.mcp_catalog = ConnectApplicationView(
+            parent=self,
+            controller=self.controller,
+            on_connected=self._on_mcp_application_connected,
+        )
+        self.mcp_catalog_group.add(self.mcp_catalog)
+
         self.mcp_group = Adw.PreferencesGroup(title=_("MCP Servers"), description=_("Manage Model Context Protocol servers"))
-        self.ToolsPage.add(self.mcp_group)
+        self.MCPPage.add(self.mcp_group)
         
         # List of servers
         self.servers_list_group = Adw.ExpanderRow(title=_("Servers"), subtitle=_("List of configured MCP servers"))
-        self.mcp_group.add(self.servers_list_group)
         
         self.mcp_server_rows = []
         self.refresh_mcp_servers_list()
@@ -1814,6 +2626,8 @@ class Settings(Adw.PreferencesWindow):
         
         self.mcp_add_button.connect("clicked", add_server)
         self.mcp_group.add(add_row)
+        self.mcp_group.add(self.servers_list_group)
+        self.MCPPage.add(self.mcp_catalog_group)
     
     def _disable_mcp_form(self):
         """Disable all MCP form fields"""
@@ -1878,6 +2692,18 @@ class Settings(Adw.PreferencesWindow):
             text = str(e).strip()
             if not text:
                 text = type(e).__name__
+            missing_command_text = text.casefold()
+            if isinstance(e, FileNotFoundError) or any(
+                marker in missing_command_text
+                for marker in ("no such file or directory", "command not found")
+            ):
+                from .mcp_catalog import _missing_command_name
+
+                command = _missing_command_name(e, "the configured command")
+                text = _(
+                    "The MCP server could not start because the command '{}' was not found. "
+                    "Install it or add it to PATH, then try again."
+                ).format(command)
             if text not in messages:
                 messages.append(text)
 
@@ -2070,6 +2896,52 @@ class Settings(Adw.PreferencesWindow):
         self.refresh_mcp_servers_list()
         self.refresh_tools_list()
 
+    def _get_active_mode_name(self):
+        """Return the active mode name, or None when the Normal mode is active."""
+        mode_manager = getattr(self.controller, "mode_manager", None)
+        if mode_manager is None:
+            return None
+        name = mode_manager.get_active_mode_name()
+        if name == DEFAULT_MODE_NAME:
+            return None
+        return name
+
+    def _get_prompt_mode_warning(self, prompt_key, base_enabled):
+        """Build the mode warning for a prompt row, None if the active mode does not change it."""
+        mode_name = self._get_active_mode_name()
+        if mode_name is None:
+            return None
+        mode_manager = self.controller.mode_manager
+        base_text = self.prompts.get(prompt_key, "")
+        resolved_enabled = mode_manager.resolve_prompt_enabled(prompt_key, base_enabled)
+        resolved_text = mode_manager.resolve_prompt_text(prompt_key, base_text)
+        details = []
+        if resolved_enabled != base_enabled:
+            details.append(_("forced on") if resolved_enabled else _("forced off"))
+        if resolved_text != base_text:
+            details.append(_("text replaced"))
+        if not details:
+            return None
+        return _('The "{}" mode overrides this prompt: {}').format(mode_name, ", ".join(details))
+
+    def _get_tool_mode_warning(self, tool_name, base_enabled):
+        """Build the mode warning for a tool row, None if the active mode does not change it."""
+        mode_name = self._get_active_mode_name()
+        if mode_name is None:
+            return None
+        resolved_enabled = self.controller.mode_manager.resolve_tool_enabled(tool_name, base_enabled)
+        if resolved_enabled == base_enabled:
+            return None
+        detail = _("forced on") if resolved_enabled else _("forced off")
+        return _('The "{}" mode overrides this tool: {}').format(mode_name, detail)
+
+    def _add_mode_warning_suffix(self, row, tooltip):
+        """Add a small warning icon to a row, hinting the active mode overrides its value."""
+        icon = Gtk.Image(icon_name="warning-outline-symbolic", css_classes=["warning"])
+        icon.set_valign(Gtk.Align.CENTER)
+        icon.set_tooltip_text(tooltip)
+        row.add_suffix(icon)
+
     def build_prompts_settings(self):
         self.prompts_settings = self.controller.newelle_settings.prompts_settings
         for prompt in self.prompts_rows:
@@ -2094,6 +2966,9 @@ class Settings(Adw.PreferencesWindow):
 
             if prompt["editable"]:
                 self.add_customize_prompt_content(row, prompt["key"], prompt["title"])
+            mode_warning = self._get_prompt_mode_warning(prompt["key"], is_active)
+            if mode_warning is not None:
+                self._add_mode_warning_suffix(row, mode_warning)
             switch = Gtk.Switch(valign=Gtk.Align.CENTER)
             switch.set_active(is_active)
             switch.connect("notify::active", self.update_prompt, prompt["setting_name"])
@@ -2472,6 +3347,18 @@ class Settings(Adw.PreferencesWindow):
             button = Gtk.Button(css_classes=["flat"], icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
             button.connect("clicked", self.copy_settings, constants, handler)
             row.add_suffix(button)
+        if constants == AVAILABLE_LLMS and model.get("duplicated", False):
+            delete_button = Gtk.Button(
+                css_classes=["flat", "error"],
+                icon_name="user-trash-symbolic",
+                valign=Gtk.Align.CENTER,
+                tooltip_text=_("Delete this LLM provider"),
+            )
+            delete_button.connect("clicked", self.on_delete_duplicated_llm, key)
+            if isinstance(row, Adw.ExpanderRow):
+                row.add_action(delete_button)
+            else:
+                row.add_suffix(delete_button)
         if "website" in model:
             row.add_suffix(self.create_web_button(model["website"]))
         # Add check button

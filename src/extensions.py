@@ -245,6 +245,35 @@ class NewelleExtension(Handler):
     def get_tools(self) -> list:
         return []
 
+    def get_modes(self) -> dict:
+        """Returns the Modes contributed by this extension.
+
+        Each key is a unique Mode name; each value is a mode dict with the
+        same shape used by :class:`ModeManager`::
+
+            {
+                "description": "<str>",      # one-line summary
+                "icon": "<str>",             # GTK symbolic icon name
+                "tools":  {"<tool_name>": "<state>", ...},   # optional
+                "skills": {"<skill_name>": "<state>", ...},  # optional
+                "prompts": {                                      # optional
+                    "<prompt_key>": {
+                        "state": "<state>",
+                        "override": "<replacement text>",         # optional
+                    },
+                },
+            }
+
+        where ``<state>`` is ``"enable"``, ``"remove"`` or ``"no_change"``.
+
+        Extension modes are added only when no mode with that name already
+        exists, so they never clobber built-ins or user-created modes.
+
+        Returns:
+            dict: ``{name: mode_dict}`` (empty by default).
+        """
+        return {}
+
     def get_commands(self) -> list[Command]:
         """Returns the list of slash commands provided by this extension.
         
@@ -395,6 +424,99 @@ class ExtensionLoader:
     def get_enabled_extensions(self) -> list[NewelleExtension]:
         return [x for x in self.get_extensions() if x not in self.disabled_extensions]
 
+    _HANDLER_CONTRIBUTION_METHODS = {
+        "llm": "get_llm_handlers",
+        "tts": "get_tts_handlers",
+        "stt": "get_stt_handlers",
+        "memory": "get_memory_handlers",
+        "embedding": "get_embedding_handlers",
+        "rag": "get_rag_handlers",
+        "websearch": "get_websearch_handlers",
+        "interface": "get_interface_handlers",
+        "image_generator": "get_image_generator_handlers",
+    }
+
+    def _get_contributing_extensions(
+        self, extension_ids=None, include_disabled=False
+    ):
+        extensions = (
+            self.extensions if include_disabled else self.get_enabled_extensions()
+        )
+        if extension_ids is None:
+            return extensions
+        extension_ids = set(extension_ids)
+        return [
+            extension for extension in extensions if extension.id in extension_ids
+        ]
+
+    def get_handler_contributions(
+        self, extension_ids=None, include_disabled=False
+    ) -> dict[str, set[str]]:
+        """Return handler keys contributed by the selected extensions."""
+        contributions = {
+            category: set() for category in self._HANDLER_CONTRIBUTION_METHODS
+        }
+        for extension in self._get_contributing_extensions(
+            extension_ids, include_disabled
+        ):
+            for category, method_name in self._HANDLER_CONTRIBUTION_METHODS.items():
+                try:
+                    handlers = getattr(extension, method_name)() or []
+                except Exception as error:
+                    print(
+                        f"Error reading {category} contributions from "
+                        f"extension '{extension.id}': {error}"
+                    )
+                    continue
+                contributions[category].update(
+                    handler["key"]
+                    for handler in handlers
+                    if isinstance(handler, dict) and "key" in handler
+                )
+        return contributions
+
+    def get_contribution_types(
+        self, extension_ids=None, include_disabled=False
+    ) -> set[str]:
+        """Return resource types provided by selected enabled extensions.
+
+        This small capability summary lets the controller avoid rebuilding
+        unrelated registries when an extension is added, removed, or toggled.
+        """
+        extensions = self._get_contributing_extensions(
+            extension_ids, include_disabled
+        )
+        contribution_types = set()
+        handler_contributions = self.get_handler_contributions(
+            extension_ids, include_disabled
+        )
+        if handler_contributions["interface"]:
+            contribution_types.add("interfaces")
+        if any(
+            keys
+            for category, keys in handler_contributions.items()
+            if category != "interface"
+        ):
+            contribution_types.add("handlers")
+
+        methods = {
+            "tools": "get_tools",
+            "prompts": "get_additional_prompts",
+            "mini_apps": "add_tab_menu_entries",
+            "modes": "get_modes",
+        }
+        for extension in extensions:
+            for contribution_type, method_name in methods.items():
+                try:
+                    if getattr(extension, method_name)():
+                        contribution_types.add(contribution_type)
+                except Exception as error:
+                    print(
+                        f"Error reading {contribution_type} contributions from "
+                        f"extension '{extension.id}': {error}"
+                    )
+        return contribution_types
+
     def load_integrations(self, AVAILABLE_INTEGRATIONS):
         for integration in AVAILABLE_INTEGRATIONS:
             integration_class = integration(self.pip, self.extension_cache, self.settings)
@@ -501,7 +623,7 @@ class ExtensionLoader:
                 AVAILABLE_EMBEDDINGS[handler["key"]] = handler
             handlers = extension.get_rag_handlers()
             for handler in handlers:
-                AVAILABLE_RAGS[handler["key"]] = handler
+                AVAILABLE_RAG[handler["key"]] = handler
             handlers = extension.get_websearch_handlers()
             for handler in handlers:
                 AVAILABLE_WEBSEARCH[handler["key"]] = handler
@@ -536,6 +658,21 @@ class ExtensionLoader:
                 if prompt not in AVAILABLE_PROMPTS:
                     AVAILABLE_PROMPTS.append(prompt)
                 PROMPTS[prompt["key"]] = prompt["text"]
+
+    def add_modes(self, mode_manager):
+        """Add the modes contributed by each extension to the ModeManager.
+
+        Args:
+            mode_manager: the application :class:`ModeManager`. Extension modes
+                are merged via :meth:`ModeManager.add_modes`, which never
+                clobbers built-ins or user-created modes.
+        """
+        for extension in self.extensions:
+            if extension in self.disabled_extensions:
+                continue
+            modes = extension.get_modes()
+            if modes:
+                mode_manager.add_modes(modes)
 
     def remove_handlers(self, extension, AVAILABLE_LLMS, AVAILABLE_TTS, AVAILABLE_STT, AVAILABLE_MEMORIES, AVAILABLE_EMBEDDINGS, AVAILABLE_RAG, AVAILABLE_WEBSEARCH, AVAILABLE_AVATARS, AVAILABLE_TRANSLATORS, AVAILABLE_INTERFACES):
         """Remove handlers of an extension
@@ -605,16 +742,19 @@ class ExtensionLoader:
             except Exception as e:
                 print(f"Error during extension uninstall cleanup: {e}")
         os.remove(os.path.join(self.extension_dir, self.filemap[extension]))
+        self.extensions_settings.pop(extension, None)
+        self.save_settings()
 
-    def add_extension(self, file_path : str):
+    def add_extension(self, file_path: str, filename: str | None = None):
         """
         Add an extension - copies the file
 
         Args:
-            file_path: the path of the file to copy 
+            file_path: the path of the file to copy
+            filename: optional destination filename
         """
-        print(self.extension_dir)
-        shutil.copyfile(file_path, os.path.join(self.extension_dir, os.path.basename(file_path)))
+        destination_name = os.path.basename(filename or file_path)
+        shutil.copyfile(file_path, os.path.join(self.extension_dir, destination_name))
         #os.makedirs(os.path.join(self.extension_cache, os.path.basename(file_path)), exist_ok=True)
 
     def get_extension_by_id(self, id: str) -> NewelleExtension | None:
@@ -655,7 +795,9 @@ class ExtensionLoader:
         if not isinstance(extension, str):
             extension = extension.id
         self.extensions_settings[extension]["disabled"] = True
-        self.disabled_extensions.append(self.get_extension_by_id(extension))
+        extension_object = self.get_extension_by_id(extension)
+        if extension_object not in self.disabled_extensions:
+            self.disabled_extensions.append(extension_object)
         self.save_settings()
 
     def save_settings(self):
